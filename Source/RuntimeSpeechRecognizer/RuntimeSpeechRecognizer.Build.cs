@@ -42,5 +42,9 @@ public class RuntimeSpeechRecognizer : ModuleRules
 		}
 
 		PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "ThirdParty", "whisper.cpp"));
+		PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "..","ThirdParty", "whisper.cpp","lib", "whisper.lib"));
+		RuntimeDependencies.Add("$(TargetOutputDir)/whisper.dll", Path.Combine(PluginDirectory, "Source/ThirdParty/whisper.cpp/bin/whisper.dll"));
 	}
+        
+        
 }

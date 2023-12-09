@@ -58,6 +58,9 @@ struct RUNTIMESPEECHRECOGNIZER_API FWhisperSpeechRecognizerState
 	/** The user data associated with the Whisper speech recognizer */
 	FWhisperSpeechRecognizerUserData WhisperUserData;
 
+
+	bool useGpu;
+
 	/**
 	 * Initializes the Whisper speech recognizer state. This also allocates memory for the context, parameters, and user data
 	 *
@@ -66,7 +69,7 @@ struct RUNTIMESPEECHRECOGNIZER_API FWhisperSpeechRecognizerState
 	 * @param SpeechRecognizerPtr Pointer to the speech recognizer thread
 	 * @return True if the initialization was successful, false otherwise
 	 */
-	bool Init(uint8* BulkDataPtr, int64 BulkDataSize, TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerPtr);
+	bool Init(uint8* BulkDataPtr, int64 BulkDataSize, TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerPtr, bool UseGpu);
 
 	/**
 	 * Releases the resources associated with the Whisper speech recognizer state
@@ -141,6 +144,8 @@ struct RUNTIMESPEECHRECOGNIZER_API FSpeechRecognitionParameters
 	UPROPERTY(BlueprintReadWrite, Category = "Runtime Speech Recognizer")
 	int32 BeamSize = -1.f;
 
+	UPROPERTY(BlueprintReadWrite, Category = "Runtime Speech Recognizer")
+	bool UseGpu = true;
 	/**
 	 * Returns the default parameters suitable for non-streaming speech recognition
 	 * @return The default parameters suitable for non-streaming speech recognition
@@ -413,6 +418,7 @@ public:
 	 */
 	bool SetBeamSize(int32 Value);
 
+	bool SetUseGPU(bool Value);
 private:
 	/**
 	 * Asynchronously load the language model data and pass it to the provided callback

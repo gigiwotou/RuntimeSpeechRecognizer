@@ -118,9 +118,14 @@ FWhisperSpeechRecognizerState::FWhisperSpeechRecognizerState()
 , WhisperParameters(nullptr)
 {}
 
-bool FWhisperSpeechRecognizerState::Init(uint8* BulkDataPtr, int64 BulkDataSize, TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerPtr)
+bool FWhisperSpeechRecognizerState::Init(uint8* BulkDataPtr, int64 BulkDataSize, TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerPtr, bool UseGpu)
 {
-	WhisperContext = whisper_init_from_buffer_with_params(BulkDataPtr, BulkDataSize, whisper_context_default_params());
+	struct whisper_context_params params = {
+		/*.use_gpu    =*/ UseGpu,
+	};
+	useGpu = UseGpu;
+	
+	WhisperContext = whisper_init_from_buffer_with_params(BulkDataPtr, BulkDataSize, params);
 	if (!WhisperContext)
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Failed to create whisper context from buffer"));
@@ -413,7 +418,7 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 			return;
 		}
 
-		if (!ThisShared->WhisperState.Init(ModelBulkDataPtr, ModelBulkDataSize, ThisShared))
+		if (!ThisShared->WhisperState.Init(ModelBulkDataPtr, ModelBulkDataSize, ThisShared, ThisShared->RecognitionParameters.UseGpu))
 		{
 			const FString ShortErrorMessage = TEXT("Recognizer initialization failed");
 			const FString LongErrorMessage = TEXT("Failed to initialize whisper from the language model");
@@ -909,6 +914,17 @@ bool FSpeechRecognizerThread::SetBeamSize(int32 Value)
 	return true;
 }
 
+bool FSpeechRecognizerThread::SetUseGPU(bool Value)
+{
+	if (!GetIsStopped())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set use gpu while the thread is running"));
+		return false;
+	}
+
+	RecognitionParameters.UseGpu = Value;
+	return true;
+}
 bool FSpeechRecognizerThread::GetIsStopped() const
 {
 	return bIsStopped;

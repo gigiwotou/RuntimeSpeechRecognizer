@@ -344,6 +344,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Runtime Speech Recognizer|Setters|Individual")
 	bool SetBeamSize(int32 Value);
 
+	UFUNCTION(BlueprintCallable, Category = "Runtime Speech Recognizer|Setters|Individual")
+	bool SetUseGPU(bool Value);
+
 private:
 	/** The thread that handles speech recognition */
 	TSharedPtr<FSpeechRecognizerThread> Thread;
