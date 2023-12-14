@@ -41,6 +41,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnSpeechRecognitionProgressDynamic,
 /** Static delegate for speech recognition progress */
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnSpeechRecognitionProgressStatic, int32);
 
+/** Dynamic delegate for speech recognition thread fully stopped */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnSpeechRecognitionStoppedDynamic);
+
+/** Static delegate for speech recognition thread fully stopped */
+DECLARE_MULTICAST_DELEGATE(FOnSpeechRecognitionStoppedStatic);
+
 
 /**
  * Represents a speech recognizer that can recognize spoken words
@@ -113,12 +119,30 @@ public:
 	void ForceProcessPendingAudioData();
 
 	/**
+	 * Clears the audio data that was queued before but not yet processed
+	 *
+	 * @param bClearPendingAudioData Whether to clear the pending audio data or not
+	 * @param bClearAudioQueue Whether to clear the audio queue or not
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Runtime Speech Recognizer|Process")
+	void ClearAudioData(bool bClearPendingAudioData, bool bClearAudioQueue);
+
+	/**
 	 * Returns whether the thread worker is stopped or not
 	 *
 	 * @return True if the thread worker is stopped, false otherwise
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Runtime Speech Recognizer|Info")
 	bool GetIsStopped() const;
+
+	/**
+	 * Returns whether the speech recognition is currently stopping (but not yet stopped) or not
+	 * It is set to true when the StopSpeechRecognition function is called, and set to false when the thread worker is fully stopped
+	 * 
+	 * @return True if the speech recognition is currently stopping, false otherwise
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Runtime Speech Recognizer|Info")
+	bool GetIsStopping() const;
 
 	/**
 	 * Returns whether all the audio data has been processed or not
@@ -153,8 +177,15 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Runtime Speech Recognizer|Delegates")
 	FOnSpeechRecognitionProgressDynamic OnRecognitionProgress;
 
-	/*** Static delegate broadcast when the speech recognition progress obtained */
+	/** Static delegate broadcast when the speech recognition progress obtained */
 	FOnSpeechRecognitionProgressStatic OnRecognitionProgressNative;
+
+	/** Dynamic delegate broadcast when the speech recognition thread is fully stopped */
+	UPROPERTY(BlueprintAssignable, Category = "Runtime Speech Recognizer|Delegates")
+	FOnSpeechRecognitionStoppedDynamic OnRecognitionStopped;
+
+	/** Static delegate broadcast when the speech recognition thread is fully stopped */
+	FOnSpeechRecognitionStoppedStatic OnRecognitionStoppedNative;
 
 	/**
 	 * Sets the parameters for speech recognition. If you want to change only specific parameters, consider using the individual setter functions

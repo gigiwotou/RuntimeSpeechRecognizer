@@ -10,7 +10,6 @@
 #include "SampleBuffer.h"
 #include "SpeechRecognizerModel.h"
 
-#include "UObject/StrongObjectPtr.h"
 #include "Async/Async.h"
 #include "AudioThread.h"
 #include "SpeechRecognizerSettings.h"
@@ -35,9 +34,9 @@ void WhisperNewTextSegmentCallback(whisper_context* WhisperContext, whisper_stat
 	}
 
 	TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerSharedPtr = static_cast<FWhisperSpeechRecognizerUserData*>(UserData)->SpeechRecognizerWeakPtr.Pin();
-	if (!SpeechRecognizerSharedPtr.IsValid())
+	if (!SpeechRecognizerSharedPtr.IsValid() || SpeechRecognizerSharedPtr->GetIsStopped() || SpeechRecognizerSharedPtr->GetIsStopping())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Warning, TEXT("Speech recognizer is not valid, text segment will not be processed"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Warning, TEXT("Aborting whisper new text segment callback due to stop request"));
 		return;
 	}
 
@@ -58,8 +57,11 @@ void WhisperNewTextSegmentCallback(whisper_context* WhisperContext, whisper_stat
 
 		AsyncTask(ENamedThreads::GameThread, [SpeechRecognizerSharedPtr, TextPerSegment_String = MoveTemp(TextPerSegment_String)]() mutable
 		{
-			UE_LOG(LogRuntimeSpeechRecognizer, Log, TEXT("Recognized text segment: \"%s\""), *TextPerSegment_String);
-			SpeechRecognizerSharedPtr->OnRecognizedTextSegment.ExecuteIfBound(TextPerSegment_String);
+			if (SpeechRecognizerSharedPtr.IsValid())
+			{
+				UE_LOG(LogRuntimeSpeechRecognizer, Log, TEXT("Recognized text segment: \"%s\""), *TextPerSegment_String);
+				SpeechRecognizerSharedPtr->OnRecognizedTextSegment.Broadcast(TextPerSegment_String);
+			}
 		});
 	}
 }
@@ -80,7 +82,7 @@ bool WhisperEncoderBeginCallback(whisper_context* WhisperContext, whisper_state*
 	}
 
 	TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerSharedPtr = static_cast<FWhisperSpeechRecognizerUserData*>(UserData)->SpeechRecognizerWeakPtr.Pin();
-	if (!SpeechRecognizerSharedPtr.IsValid() || SpeechRecognizerSharedPtr->GetIsStopped())
+	if (!SpeechRecognizerSharedPtr.IsValid() || SpeechRecognizerSharedPtr->GetIsStopped() || SpeechRecognizerSharedPtr->GetIsStopping())
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Warning, TEXT("Aborting whisper recognition due to stop request"));
 		return false;
@@ -98,9 +100,9 @@ void WhisperProgressCallback(whisper_context* WhisperContext, whisper_state* Whi
 	}
 
 	TSharedPtr<FSpeechRecognizerThread> SpeechRecognizerSharedPtr = static_cast<FWhisperSpeechRecognizerUserData*>(UserData)->SpeechRecognizerWeakPtr.Pin();
-	if (!SpeechRecognizerSharedPtr.IsValid() || SpeechRecognizerSharedPtr->GetIsStopped())
+	if (!SpeechRecognizerSharedPtr.IsValid() || SpeechRecognizerSharedPtr->GetIsStopped() || SpeechRecognizerSharedPtr->GetIsStopping())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Warning, TEXT("Aborting whisper recognition due to stop request"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Warning, TEXT("Aborting whisper progress callback due to stop request"));
 		return;
 	}
 
@@ -109,7 +111,8 @@ void WhisperProgressCallback(whisper_context* WhisperContext, whisper_state* Whi
 	AsyncTask(ENamedThreads::GameThread, [SpeechRecognizerSharedPtr, Progress]() mutable
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Log, TEXT("Speech recognition progress: %d"), Progress);
-		SpeechRecognizerSharedPtr->OnRecognitionProgress.ExecuteIfBound(Progress);
+		SpeechRecognizerSharedPtr->LastProgress = Progress;
+		SpeechRecognizerSharedPtr->OnRecognitionProgress.Broadcast(Progress);
 	});
 }
 
@@ -340,6 +343,7 @@ void FSpeechRecognizerThread::FPendingAudioData::RecalculateTotalMixedAndResampl
 FSpeechRecognizerThread::FSpeechRecognizerThread()
 	: bIsStopped(true)
 , bIsFinished(true)
+, bIsStopping(false)
 {
 	whisper_log_set([](enum ggml_log_level Level, const char* Text, void* UserData)
 	{
@@ -361,6 +365,12 @@ FSpeechRecognizerThread::FSpeechRecognizerThread()
 FSpeechRecognizerThread::~FSpeechRecognizerThread()
 {
 	StopThread();
+
+	if (Thread.IsValid())
+	{
+		Thread->WaitForCompletion();
+		Thread.Reset();
+	}
 }
 
 TFuture<bool> FSpeechRecognizerThread::StartThread()
@@ -369,6 +379,14 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 	{
 		const FString ShortErrorMessage = TEXT("Thread start failed");
 		const FString LongErrorMessage = TEXT("Unable to start an already running thread");
+		ReportError(ShortErrorMessage, LongErrorMessage);
+		return MakeFulfilledPromise<bool>(false).GetFuture();
+	}
+
+	if (GetIsStopping())
+	{
+		const FString ShortErrorMessage = TEXT("Thread start failed");
+		const FString LongErrorMessage = TEXT("Unable to start a thread that is stopping");
 		ReportError(ShortErrorMessage, LongErrorMessage);
 		return MakeFulfilledPromise<bool>(false).GetFuture();
 	}
@@ -390,8 +408,6 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 		return MakeFulfilledPromise<bool>(false).GetFuture();
 	}
 
-	StartThreadPromise = MakeUnique<TPromise<bool>>();
-
 	// Check if the language is valid
 	{
 		const char* LanguageString = EnumToString(RecognitionParameters.Language);
@@ -404,7 +420,23 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 		}
 	}
 
-	auto OnLanguageModelLoaded = [ThisShared](bool bSuccess, uint8* ModelBulkDataPtr, int64 ModelBulkDataSize)
+	if (StartThreadPromise.IsValid())
+	{
+		const FString ShortErrorMessage = TEXT("Thread start failed");
+		const FString LongErrorMessage = TEXT("Unable to start a thread that is already starting");
+		ReportError(ShortErrorMessage, LongErrorMessage);
+		return MakeFulfilledPromise<bool>(false).GetFuture();
+	}
+
+	StartThreadPromise = MakeUnique<TPromise<bool>>();
+
+	auto SetStartThreadPromiseValue = [](TSharedRef<FSpeechRecognizerThread> ThisShared, bool bSuccess)
+	{
+		ThisShared->StartThreadPromise->SetValue(bSuccess);
+		ThisShared->StartThreadPromise.Reset();
+	};
+
+	auto OnLanguageModelLoaded = [ThisShared, SetStartThreadPromiseValue](bool bSuccess, uint8* ModelBulkDataPtr, int64 ModelBulkDataSize)
 	{
 		if (!ThisShared.IsValid())
 		{
@@ -414,7 +446,7 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 
 		if (!bSuccess)
 		{
-			ThisShared->StartThreadPromise->SetValue(false);
+			SetStartThreadPromiseValue(ThisShared.ToSharedRef(), false);
 			return;
 		}
 
@@ -423,7 +455,7 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 			const FString ShortErrorMessage = TEXT("Recognizer initialization failed");
 			const FString LongErrorMessage = TEXT("Failed to initialize whisper from the language model");
 			ThisShared->ReportError(ShortErrorMessage, LongErrorMessage);
-			ThisShared->StartThreadPromise->SetValue(false);
+			SetStartThreadPromiseValue(ThisShared.ToSharedRef(), false);
 			return;
 		}
 
@@ -437,7 +469,7 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 				const FString ShortErrorMessage = TEXT("Automatic language detection failed");
 				const FString LongErrorMessage = TEXT("The selected language model does not support multilingual recognition therefore automatic language detection is not possible");
 				ThisShared->ReportError(ShortErrorMessage, LongErrorMessage);
-				ThisShared->StartThreadPromise->SetValue(false);
+				SetStartThreadPromiseValue(ThisShared.ToSharedRef(), false);
 				return;
 			}
 
@@ -446,11 +478,14 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 				const FString ShortErrorMessage = TEXT("Translation failed");
 				const FString LongErrorMessage = TEXT("The selected language model does not support multilingual recognition therefore translation is not possible");
 				ThisShared->ReportError(ShortErrorMessage, LongErrorMessage);
-				ThisShared->StartThreadPromise->SetValue(false);
+				SetStartThreadPromiseValue(ThisShared.ToSharedRef(), false);
 				return;
 			}
 		}
 
+		ThisShared->Thread.Reset();
+
+		ThisShared->bIsStopping.AtomicSet(false);
 		ThisShared->RecognitionParameters.FillWhisperStateParameters(ThisShared->WhisperState);
 		ThisShared->bIsStopped.AtomicSet(false);
 		ThisShared->bIsFinished.AtomicSet(true);
@@ -461,12 +496,12 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 			const FString ShortErrorMessage = TEXT("Thread creation failed");
 			const FString LongErrorMessage = TEXT("Failed to create the thread for the speech recognizer");
 			ThisShared->ReportError(ShortErrorMessage, LongErrorMessage);
-			ThisShared->StartThreadPromise->SetValue(false);
+			SetStartThreadPromiseValue(ThisShared.ToSharedRef(), false);
 			return;
 		}
 
-		ThisShared->Thread = TUniquePtr<FRunnableThread>(ThreadPtr);
-		ThisShared->StartThreadPromise->SetValue(true);
+		ThisShared->Thread.Reset(ThreadPtr);
+		SetStartThreadPromiseValue(ThisShared.ToSharedRef(), true);
 	};
 
 	LoadLanguageModel(OnLanguageModelLoaded);
@@ -475,15 +510,17 @@ TFuture<bool> FSpeechRecognizerThread::StartThread()
 
 void FSpeechRecognizerThread::StopThread()
 {
-	Stop();
-
-	if (Thread.IsValid())
+	if (DoesSharedInstanceExist())
 	{
-		Thread->WaitForCompletion();
-		Thread.Reset();
+		TSharedPtr<FSpeechRecognizerThread> ThisShared = AsShared();
+		AsyncTask(ENamedThreads::AnyBackgroundHiPriTask, [ThisShared]() mutable
+		{
+			if (ThisShared)
+			{
+				ThisShared->Thread.Reset();
+			}
+		});
 	}
-
-	bIsFinished.AtomicSet(true);
 }
 
 void FSpeechRecognizerThread::ProcessPCMData(Audio::FAlignedFloatBuffer PCMData, float SampleRate, uint32 NumOfChannels, bool bLast)
@@ -492,6 +529,14 @@ void FSpeechRecognizerThread::ProcessPCMData(Audio::FAlignedFloatBuffer PCMData,
 	{
 		const FString ShortErrorMessage = TEXT("Audio processing failed");
 		const FString LongErrorMessage = TEXT("The audio data could not be processed to the recognizer since the thread is stopped");
+		ReportError(ShortErrorMessage, LongErrorMessage);
+		return;
+	}
+
+	if (GetIsStopping())
+	{
+		const FString ShortErrorMessage = TEXT("Audio processing failed");
+		const FString LongErrorMessage = TEXT("The audio data could not be processed to the recognizer since the thread is stopping");
 		ReportError(ShortErrorMessage, LongErrorMessage);
 		return;
 	}
@@ -592,6 +637,14 @@ void FSpeechRecognizerThread::ForceProcessPendingAudioData()
 		return;
 	}
 
+	if (GetIsStopping())
+	{
+		const FString ShortErrorMessage = TEXT("Audio processing failed");
+		const FString LongErrorMessage = TEXT("The audio data could not be processed to the recognizer since the thread is stopping");
+		ReportError(ShortErrorMessage, LongErrorMessage);
+		return;
+	}
+
 	// Make sure to process the data in background thread
 	if (IsInGameThread())
 	{
@@ -622,11 +675,33 @@ void FSpeechRecognizerThread::ForceProcessPendingAudioData()
 	UE_LOG(LogRuntimeSpeechRecognizer, Log, TEXT("Enqueued audio data from the pending audio to the queue of the speech recognizer as the last data (num of samples: %d)"), NumOfQueuedSamples);
 }
 
+void FSpeechRecognizerThread::ClearAudioData(bool bClearPendingAudioData, bool bClearAudioQueue)
+{
+	if (bClearPendingAudioData)
+	{
+		PendingAudio = FPendingAudioData();
+	}
+	if (bClearAudioQueue)
+	{
+		AudioQueue.Empty();
+	}
+}
+
 bool FSpeechRecognizerThread::Init()
 {
 	if (GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot initialize the thread since it is stopped"));
+		const FString ShortErrorMessage = TEXT("Thread initialization failed");
+		const FString LongErrorMessage = TEXT("Unable to initialize a stopped thread");
+		ReportError(ShortErrorMessage, LongErrorMessage);
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		const FString ShortErrorMessage = TEXT("Thread initialization failed");
+		const FString LongErrorMessage = TEXT("Unable to initialize a thread that is stopping");
+		ReportError(ShortErrorMessage, LongErrorMessage);
 		return false;
 	}
 
@@ -641,7 +716,7 @@ bool FSpeechRecognizerThread::Init()
 
 uint32 FSpeechRecognizerThread::Run()
 {
-	while (!bIsStopped)
+	while (!GetIsStopped() && !GetIsStopping())
 	{
 		Audio::FAlignedFloatBuffer NewQueuedBuffer;
 		while (AudioQueue.Dequeue(NewQueuedBuffer))
@@ -654,7 +729,7 @@ uint32 FSpeechRecognizerThread::Run()
 			UE_LOG(LogRuntimeSpeechRecognizer, Log, TEXT("Processed audio data with the size of %d samples to the whisper recognizer"), NewQueuedBuffer.Num());
 		}
 
-		if (PendingAudio.GetTotalMixedAndResampledSize() == 0 && !bIsFinished)
+		if (DoesSharedInstanceExist() && PendingAudio.GetTotalMixedAndResampledSize() == 0 && !GetIsFinished())
 		{
 			bIsFinished.AtomicSet(true);
 			TSharedPtr<FSpeechRecognizerThread> ThisShared = AsShared();
@@ -665,15 +740,30 @@ uint32 FSpeechRecognizerThread::Run()
 					UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Failed to get shared instance"));
 					return;
 				}
-				ThisShared->OnRecognitionProgress.ExecuteIfBound(100);
-				ThisShared->OnRecognitionFinished.ExecuteIfBound();
+				if (ThisShared->LastProgress < 100)
+				{
+					ThisShared->OnRecognitionProgress.Broadcast(100);
+				}
+				ThisShared->OnRecognitionFinished.Broadcast();
 			});
 		}
 	}
 
-	if (GetIsStopped())
+	if (GetIsStopping())
 	{
-		ReleaseMemory();
+		if (DoesSharedInstanceExist())
+		{
+			TSharedPtr<FSpeechRecognizerThread> ThisShared = AsShared();
+			AsyncTask(ENamedThreads::GameThread, [ThisShared]()
+			{
+				if (!ThisShared.IsValid())
+				{
+					UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Failed to get shared instance"));
+					return;
+				}
+				ThisShared->OnRecognitionStopped.Broadcast();
+			});
+		}
 	}
 
 	return 0;
@@ -681,14 +771,18 @@ uint32 FSpeechRecognizerThread::Run()
 
 void FSpeechRecognizerThread::Stop()
 {
-	WhisperState.WhisperUserData = FWhisperSpeechRecognizerUserData();
+	bIsStopping.AtomicSet(true);
 	bIsFinished.AtomicSet(true);
-	bIsStopped.AtomicSet(true);
+	WhisperState.WhisperUserData = FWhisperSpeechRecognizerUserData();
 	FRunnable::Stop();
+	UE_LOG(LogRuntimeSpeechRecognizer, Log, TEXT("Stopping the speech recognizer thread"));
 }
 
 void FSpeechRecognizerThread::Exit()
 {
+	bIsStopping.AtomicSet(false);
+	bIsStopped.AtomicSet(true);
+	bIsFinished.AtomicSet(true);
 	ReleaseMemory();
 	FRunnable::Exit();
 }
@@ -697,7 +791,13 @@ bool FSpeechRecognizerThread::SetRecognitionParameters(const FSpeechRecognitionP
 {
 	if (!GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set recognition parameters while the thread is running"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set recognition parameters while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set recognition parameters while the thread is stopping"));
 		return false;
 	}
 
@@ -719,7 +819,13 @@ bool FSpeechRecognizerThread::SetNonStreamingDefaults()
 {
 	if (!GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set non-streaming defaults while the thread is running"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set non-streaming defaults while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set non-streaming defaults while the thread is stopping"));
 		return false;
 	}
 
@@ -731,7 +837,13 @@ bool FSpeechRecognizerThread::SetStreamingDefaults()
 {
 	if (!GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set streaming defaults while the thread is running"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set streaming defaults while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set streaming defaults while the thread is stopping"));
 		return false;
 	}
 
@@ -743,7 +855,13 @@ bool FSpeechRecognizerThread::SetNumOfThreads(int32 Value)
 {
 	if (!GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set the number of threads while the thread is running"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set the number of threads while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set the number of threads while the thread is stopping"));
 		return false;
 	}
 
@@ -755,14 +873,20 @@ bool FSpeechRecognizerThread::SetLanguage(ESpeechRecognizerLanguage Language)
 {
 	if (!GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set language while the thread is running"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set language while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set language while the thread is stopping"));
 		return false;
 	}
 
 	const USpeechRecognizerSettings* SpeechRecognizerSettings = GetDefault<USpeechRecognizerSettings>();
 	if (RecognitionParameters.Language == ESpeechRecognizerLanguage::Auto && SpeechRecognizerSettings->ModelLanguage == ESpeechRecognizerModelLanguage::EnglishOnly)
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set language to 'auto' when the model is English only"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set language to 'auto' when the model is English only"));
 		return false;
 	}
 
@@ -774,7 +898,13 @@ bool FSpeechRecognizerThread::SetTranslateToEnglish(bool bTranslate)
 {
 	if (!GetIsStopped())
 	{
-		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Cannot set translation while the thread is running"));
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set translation while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set translation while the thread is stopping"));
 		return false;
 	}
 
@@ -790,6 +920,12 @@ bool FSpeechRecognizerThread::SetStepSize(int32 Value)
 		return false;
 	}
 
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set step size while the thread is stopping"));
+		return false;
+	}
+
 	RecognitionParameters.StepSizeMs = Value;
 	return true;
 }
@@ -799,6 +935,12 @@ bool FSpeechRecognizerThread::SetNoContext(bool bNoContext)
 	if (!GetIsStopped())
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set no context while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set no context while the thread is stopping"));
 		return false;
 	}
 
@@ -814,6 +956,12 @@ bool FSpeechRecognizerThread::SetSingleSegment(bool bSingleSegment)
 		return false;
 	}
 
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set single segment while the thread is stopping"));
+		return false;
+	}
+
 	RecognitionParameters.bSingleSegment = bSingleSegment;
 	return true;
 }
@@ -823,6 +971,12 @@ bool FSpeechRecognizerThread::SetMaxTokens(int32 Value)
 	if (!GetIsStopped())
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set max tokens while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set max tokens while the thread is stopping"));
 		return false;
 	}
 
@@ -838,6 +992,12 @@ bool FSpeechRecognizerThread::SetSpeedUp(bool bSpeedUp)
 		return false;
 	}
 
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set speed up while the thread is stopping"));
+		return false;
+	}
+
 	RecognitionParameters.bSpeedUp = bSpeedUp;
 	return true;
 }
@@ -847,6 +1007,12 @@ bool FSpeechRecognizerThread::SetAudioContextSize(int32 Value)
 	if (!GetIsStopped())
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set audio context size while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set audio context size while the thread is stopping"));
 		return false;
 	}
 
@@ -862,6 +1028,12 @@ bool FSpeechRecognizerThread::SetTemperatureToIncrease(float Value)
 		return false;
 	}
 
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set temperature to increase while the thread is stopping"));
+		return false;
+	}
+
 	RecognitionParameters.TemperatureToIncrease = Value;
 	return true;
 }
@@ -871,6 +1043,12 @@ bool FSpeechRecognizerThread::SetEntropyThreshold(float Value)
 	if (!GetIsStopped())
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set entropy threshold while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set entropy threshold while the thread is stopping"));
 		return false;
 	}
 
@@ -886,6 +1064,12 @@ bool FSpeechRecognizerThread::SetSuppressBlank(bool Value)
 		return false;
 	}
 
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set suppress blanks in output while the thread is stopping"));
+		return false;
+	}
+
 	RecognitionParameters.bSuppressBlank = Value;
 	return true;
 }
@@ -898,6 +1082,12 @@ bool FSpeechRecognizerThread::SetSuppressNonSpeechTokens(bool Value)
 		return false;
 	}
 
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set suppress non speech tokens in output while the thread is stopping"));
+		return false;
+	}
+
 	RecognitionParameters.bSuppressNonSpeechTokens = Value;
 	return true;
 }
@@ -907,6 +1097,12 @@ bool FSpeechRecognizerThread::SetBeamSize(int32 Value)
 	if (!GetIsStopped())
 	{
 		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set beam size while the thread is running"));
+		return false;
+	}
+
+	if (GetIsStopping())
+	{
+		UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("Unable to set beam size while the thread is stopping"));
 		return false;
 	}
 
@@ -928,6 +1124,11 @@ bool FSpeechRecognizerThread::SetUseGPU(bool Value)
 bool FSpeechRecognizerThread::GetIsStopped() const
 {
 	return bIsStopped;
+}
+
+bool FSpeechRecognizerThread::GetIsStopping() const
+{
+	return bIsStopping;
 }
 
 bool FSpeechRecognizerThread::GetIsFinished() const
@@ -1024,10 +1225,21 @@ void FSpeechRecognizerThread::LoadLanguageModel(TFunction<void(bool, uint8*, int
 void FSpeechRecognizerThread::ReleaseMemory()
 {
 	WhisperState.Release();
+	Thread.Reset();
 }
 
 void FSpeechRecognizerThread::ReportError(const FString& ShortErrorMessage, const FString& LongErrorMessage)
 {
-	UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("%s: %s"), *ShortErrorMessage, *LongErrorMessage);
-	OnRecognitionError.ExecuteIfBound(ShortErrorMessage, LongErrorMessage);
+	if (DoesSharedInstanceExist())
+	{
+		TSharedPtr<FSpeechRecognizerThread> ThisShared = AsShared();
+		AsyncTask(ENamedThreads::GameThread, [ThisShared, ShortErrorMessage, LongErrorMessage]() mutable
+		{
+			if (ThisShared)
+			{
+				UE_LOG(LogRuntimeSpeechRecognizer, Error, TEXT("%s: %s"), *ShortErrorMessage, *LongErrorMessage);
+				ThisShared->OnRecognitionError.Broadcast(ShortErrorMessage, LongErrorMessage);
+			}
+		});
+	}
 }
