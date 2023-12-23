@@ -364,13 +364,7 @@ FSpeechRecognizerThread::FSpeechRecognizerThread()
 
 FSpeechRecognizerThread::~FSpeechRecognizerThread()
 {
-	StopThread();
-
-	if (Thread.IsValid())
-	{
-		Thread->WaitForCompletion();
-		Thread.Reset();
-	}
+	ReleaseMemory();
 }
 
 TFuture<bool> FSpeechRecognizerThread::StartThread()
@@ -517,7 +511,7 @@ void FSpeechRecognizerThread::StopThread()
 		{
 			if (ThisShared)
 			{
-				ThisShared->Thread.Reset();
+				ThisShared->ReleaseMemory();
 			}
 		});
 	}
@@ -1224,8 +1218,8 @@ void FSpeechRecognizerThread::LoadLanguageModel(TFunction<void(bool, uint8*, int
 
 void FSpeechRecognizerThread::ReleaseMemory()
 {
-	WhisperState.Release();
 	Thread.Reset();
+	WhisperState.Release();
 }
 
 void FSpeechRecognizerThread::ReportError(const FString& ShortErrorMessage, const FString& LongErrorMessage)
